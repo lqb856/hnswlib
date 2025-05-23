@@ -4,7 +4,7 @@
 #include <assert.h>
 #include <unordered_map>
 
-namespace hnswlib {
+namespace hnswmips {
 
 template<typename DOCIDTYPE>
 class BaseMultiVectorSpace : public SpaceInterface<float> {
@@ -273,4 +273,4 @@ class EpsilonSearchStopCondition : public BaseSearchStopCondition<dist_t> {
 
     ~EpsilonSearchStopCondition() {}
 };
-}  // namespace hnswlib
+}  // namespace hnswmips

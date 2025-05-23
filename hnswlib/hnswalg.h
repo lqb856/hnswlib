@@ -10,7 +10,7 @@
 #include <list>
 #include <memory>
 
-namespace hnswlib {
+namespace hnswmips {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
@@ -1409,4 +1409,4 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
     }
 };
-}  // namespace hnswlib
+}  // namespace hnswmips

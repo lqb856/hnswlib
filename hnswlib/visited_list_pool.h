@@ -4,7 +4,7 @@
 #include <string.h>
 #include <deque>
 
-namespace hnswlib {
+namespace hnswmips {
 typedef unsigned short int vl_type;
 
 class VisitedList {
@@ -75,4 +75,4 @@ class VisitedListPool {
         }
     }
 };
-}  // namespace hnswlib
+}  // namespace hnswmips

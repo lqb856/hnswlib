@@ -1,7 +1,7 @@
 #pragma once
 #include "hnswlib.h"
 
-namespace hnswlib {
+namespace hnswmips {
 
 static float
 L2Sqr(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
@@ -321,4 +321,4 @@ class L2SpaceI : public SpaceInterface<int> {
 
     ~L2SpaceI() {}
 };
-}  // namespace hnswlib
+}  // namespace hnswmips

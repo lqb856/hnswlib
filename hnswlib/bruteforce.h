@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <assert.h>
 
-namespace hnswlib {
+namespace hnswmips {
 template<typename dist_t>
 class BruteforceSearch : public AlgorithmInterface<dist_t> {
  public:
@@ -170,4 +170,4 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
         input.close();
     }
 };
-}  // namespace hnswlib
+}  // namespace hnswmips
