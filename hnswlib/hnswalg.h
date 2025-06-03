@@ -3,6 +3,8 @@
 #include "visited_list_pool.h"
 #include "hnswlib.h"
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
@@ -208,6 +210,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
         double r = -log(distribution(level_generator_)) * reverse_size;
         return (int) r;
+        // return 0;
     }
 
     size_t getMaxElements() {
@@ -471,6 +474,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     good = false;
                     break;
                 }
+
+                // IPDG prune method
+                // dist_t self_ip = fstdistfunc_(getDataByInternalId(curent_pair.second),
+                //                         getDataByInternalId(curent_pair.second),
+                //                         dist_func_param_);
+                // dist_t curdist = fstdistfunc_(getDataByInternalId(second_pair.second),
+                //                         getDataByInternalId(curent_pair.second),
+                //                         dist_func_param_);
+                // if (self_ip < curdist) {
+                //     good = false;
+                //     break;
+                // }
             }
             if (good) {
                 return_list.push_back(curent_pair);
@@ -1407,6 +1422,59 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             std::cout << "Min inbound: " << min1 << ", Max inbound:" << max1 << "\n";
         }
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
+    }
+
+    // remove origin node
+    // for Möbius algorithm
+    // remove origin node and its connections
+    void remove_oringin(labeltype origin) {
+        if (label_lookup_[origin] == enterpoint_node_) {
+            std::cout << "Origin node is enterpoint node" << std::endl;
+        }
+        // markDelete(origin);
+        remove_origin_links(origin);
+    }
+
+    // Remove origin node's connections.
+    // Origin node can not be search after remove.
+    // We suppose that origin node has lable 0.
+    void remove_origin_links(labeltype origin) {
+        tableint origin_id = label_lookup_[origin];
+        if (origin_id < 0 || origin_id >= cur_element_count)
+            throw std::runtime_error("id error");
+        for (size_t i = 1; i < cur_element_count; i++) {
+            tableint curid = label_lookup_[i];
+            int level = element_levels_[curid];
+            for (int l = 0; l < level; l++) {
+                linklistsizeint *ll_cur = get_linklist_at_level(curid, l);
+                int size = getListCount(ll_cur);
+                tableint *data = (tableint *) (ll_cur + 1);
+                int left = 0, right = 0, count = 0;
+                while (right < size) {
+                    if (data[right] == origin_id) {
+                        right++;
+                        count++;
+                    } else {
+                        data[left] = data[right];
+                        left++;
+                        right++;
+                    }
+                }
+                setListCount(ll_cur, size - count);
+            }
+        }
+        std::cout << "All links to origin node are removed!" << std::endl;
+    }
+
+    // replace data with original data
+    // for Möbius algorithm
+    void replace_data(int count, labeltype *labels, float *data) {
+        for (int i = 0; i < count; i++) {
+            tableint id = label_lookup_[labels[i]];
+            if (id < 0 || id >= cur_element_count)
+                throw std::runtime_error("id error");
+            memcpy(getDataByInternalId(id), (uint8_t*)data + i * data_size_, data_size_);
+        }
     }
 };
 }  // namespace hnswmips
