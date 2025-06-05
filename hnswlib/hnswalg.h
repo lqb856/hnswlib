@@ -2,19 +2,114 @@
 
 #include "visited_list_pool.h"
 #include "hnswlib.h"
+#include <algorithm>
 #include <atomic>
+#include <cfloat>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <iomanip>
+#include <mutex>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <vector>
 
 namespace hnswmips {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
+
+struct StateTable {
+    double norm_avg_ = 0.0;
+    double norm_var_ = 0.0;
+    double norm_max_ = 0.0;
+    double norm_min_ = FLT_MAX;
+    int max_degree_ = 0;
+    int min_degree_ = 1e6;
+    int avg_degree_ = 0;
+
+    double candidate_angle_mean_ = 0.0;
+    double candidate_angle_var_ = 0.0;
+    int prune_count_ = 0;
+    std::vector<float> candidates_angle_mean_;
+    std::vector<float> candidates_angle_var_;
+  
+    void reset() {
+        norm_avg_ = 0.0;
+        norm_max_ = 0.0;
+        norm_min_ = FLT_MAX;
+        norm_var_ = 0.0;
+        max_degree_ = 0;
+        min_degree_ = 1e6;
+        avg_degree_ = 0;
+    }
+  
+    void print() {
+        // std::cout << "norm avg: " << norm_avg_ << std::endl;
+        // std::cout << "norm var: " << norm_var_ << std::endl;
+        // std::cout << "norm max: " << norm_max_ << std::endl;
+        // std::cout << "norm min: " << norm_min_ << std::endl;
+        // std::cout << "max degree: " << max_degree_ << std::endl;
+        // std::cout << "min degree: " << min_degree_ << std::endl;
+        // std::cout << "avg degree: " << avg_degree_ << std::endl;
+
+        candidate_angle_mean_ /= prune_count_;
+        candidate_angle_var_ /= prune_count_;
+        printHistogram();
+    }
+
+    void printHistogram() const {
+        // 1. 准备角度数据（合并均值和方差）
+        std::vector<float> all_angles;
+        all_angles.insert(all_angles.end(), 
+                         candidates_angle_mean_.begin(),
+                         candidates_angle_mean_.end());
+        
+        // 2. 计算统计量
+        float min_val = *std::min_element(all_angles.begin(), all_angles.end());
+        float max_val = *std::max_element(all_angles.begin(), all_angles.end());
+        float range = max_val - min_val;
+
+        const int max_bar_length = 100;
+        const int bins = 50;
+        
+        // 3. 初始化直方图桶
+        std::vector<int> hist(bins, 0);
+        for (float val : all_angles) {
+            int idx = std::min(static_cast<int>((val - min_val) / range * bins), bins - 1);
+            hist[idx]++;
+        }
+        
+        // 4. 打印直方图
+        std::cout << "\n=== Angle Distribution Histogram ===\n";
+        std::cout << "Range: [" << min_val << ", " << max_val << "]\n";
+        std::cout << "Bin Size: " << range / bins << "\n\n";
+        
+        int max_count = *std::max_element(hist.begin(), hist.end());
+        float scale = (max_count > 0) ? float(max_bar_length) / max_count : 1.0f;
+        for (int i = 0; i < bins; ++i) {
+            float bin_start = min_val + i * range / bins;
+            float bin_end = bin_start + range / bins;
+            std::cout << std::fixed << std::setprecision(2)
+                      << "[" << bin_start << ", " << bin_end << "): ";
+            
+            // 比例条显示
+            int bar_length = std::max(1, static_cast<int>(hist[i] * scale)); 
+            std::cout << std::string(bar_length, '#') 
+                      << " (" << hist[i] << ")\n";
+        }
+        
+        // 5. 打印统计摘要
+        std::cout << "\n=== Statistical Summary ===\n";
+        std::cout << "Global Mean: " << candidate_angle_mean_ << "\n";
+        std::cout << "Global Variance: " << candidate_angle_var_ << "\n";
+        std::cout << "Prune Count: " << prune_count_ << "\n";
+    }
+  };
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -32,6 +127,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t maxM0_{0};
     size_t ef_construction_{0};
     size_t ef_{ 0 };
+    float prune_threshold_{0.0};
+    float prune_threshold_l0_{0.0};
 
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
@@ -55,8 +152,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     size_t data_size_{0};
 
+    SpaceInterface<dist_t> *s_;
     DISTFUNC<dist_t> fstdistfunc_;
     void *dist_func_param_{nullptr};
+    dist_t *norm_;
+
+    std::mutex table_lock;
+    StateTable ST;
 
     mutable std::mutex label_lookup_lock;  // lock for label_lookup_
     std::unordered_map<labeltype, tableint> label_lookup_;
@@ -74,6 +176,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
+        s_ = s;
     }
 
 
@@ -93,6 +196,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_t max_elements,
         size_t M = 16,
         size_t ef_construction = 200,
+        float prune_angle = 60,
         size_t random_seed = 100,
         bool allow_replace_deleted = false)
         : label_op_locks_(MAX_LABEL_OPERATION_LOCKS),
@@ -101,9 +205,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             allow_replace_deleted_(allow_replace_deleted) {
         max_elements_ = max_elements;
         num_deleted_ = 0;
+
+        s_ = s;
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
+        norm_ = (dist_t *) malloc(max_elements * sizeof(dist_t));
+
         if ( M <= 10000 ) {
             M_ = M;
         } else {
@@ -115,6 +223,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         maxM0_ = M_ * 2;
         ef_construction_ = std::max(ef_construction, M_);
         ef_ = 10;
+        prune_threshold_ = std::cos(prune_angle * M_PI / 180.0);
+        prune_threshold_l0_ = std::cos(prune_angle * M_PI / 180.0 / 2);
 
         level_generator_.seed(random_seed);
         update_probability_generator_.seed(random_seed + 1);
@@ -158,6 +268,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 free(linkLists_[i]);
         }
         free(linkLists_);
+        free(norm_);
         linkLists_ = nullptr;
         cur_element_count = 0;
         visited_list_pool_.reset(nullptr);
@@ -223,6 +334,55 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     size_t getDeletedCount() {
         return num_deleted_;
+    }
+
+    // 获取基于系统时间的随机数生成器
+    std::mt19937 init_random_engine() {
+        // 获取高精度时间戳（纳秒级）
+        auto now = std::chrono::high_resolution_clock::now();
+        auto nanos = std::chrono::time_point_cast<std::chrono::nanoseconds>(now);
+        
+        // 转换为整数种子值
+        unsigned seed = static_cast<unsigned>(nanos.time_since_epoch().count());
+        
+        // 初始化随机引擎
+        return std::mt19937(seed);
+    }
+
+    /**
+    * @brief 分段加权裁边概率计算函数（适配内积搜索场景）
+    * @param rank 当前候选边的排序位置（0起始）
+    * @param max_rank 当前层最大候选边数
+    * @param high_rank_ratio 高优先级段比例（默认0.2）
+    * @param base_prob 基础概率值（默认0.9）
+    * @return 保留该边的概率[0,1]
+    * @throws std::invalid_argument 参数非法时抛出异常
+    */
+    inline double calc_prune_probability(
+        size_t rank, 
+        size_t max_rank,
+        double high_rank_ratio = 0.01,
+        double base_prob = 1.0) {
+    
+        if (max_rank == 0) throw std::invalid_argument("max_rank cannot be zero");
+        if (high_rank_ratio <= 0 || high_rank_ratio >= 1) 
+            throw std::invalid_argument("high_rank_ratio must in (0,1)");
+    
+        const double normalized_rank = static_cast<double>(rank) / max_rank;
+        const double threshold = high_rank_ratio;
+    
+        // 高优先级段：线性衰减
+        if (normalized_rank < threshold) {
+            return base_prob - (base_prob - 0.5) * (normalized_rank / threshold);
+        } 
+        // 低优先级段：二次衰减
+        else {
+            // double remaining_ratio = (normalized_rank - threshold) / (1 - threshold);
+            // return 0.5 * exp(-8 * remaining_ratio * remaining_ratio);
+            double remaining_ratio = (normalized_rank - threshold) / (1 - threshold);
+            // 组合指数衰减与幂次衰减
+            return 0.5 * pow(1 - remaining_ratio, 5);
+        }
     }
 
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
@@ -442,38 +602,155 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return top_candidates;
     }
 
+    /**
+    * @brief 基于独立概率判断是否保留节点（无需归一化）
+    * @param rank 当前节点的排序位置
+    * @param max_rank 候选集大小
+    * @param rng 随机数生成器
+    * @return 是否保留该节点
+    */
+    inline bool should_retain_independent(
+        size_t rank, 
+        size_t max_rank,
+        size_t min_retain,
+        std::mt19937& rng) {
+    
+        if (rank < min_retain) return true;
+    
+        // 计算保留概率
+        double prob = calc_prune_probability(rank - min_retain, max_rank);
+        
+        // 生成[0,1)随机数判断
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return dist(rng) < prob;
+    }
+
+    inline float cosine_similarity(const std::vector<float>& vec1, const std::vector<float>& vec2) {
+        float dot = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
+        for (size_t i = 0; i < vec1.size(); ++i) {
+            dot += vec1[i] * vec2[i];
+            norm1 += vec1[i] * vec1[i];
+            norm2 += vec2[i] * vec2[i];
+        }
+        return dot / (std::sqrt(norm1) * std::sqrt(norm2) + 1e-15f);
+    }
+
+    // 动态角度调整函数
+    float dynamic_angle_threshold(
+        const tableint query,
+        const std::vector<std::pair<dist_t, tableint>>& candidates,
+        int k = 5,
+        float angle_min = 30.0f,
+        float angle_max = 60.0f
+    ) {
+        if (candidates.size() < 2) return angle_min; // 至少需要2个点计算方向变化
+
+        k = std::min(k, static_cast<int>(candidates.size()));
+        std::vector<std::vector<float>> local_vecs;
+        local_vecs.reserve(k);
+
+        // 生成局部方向向量（从查询点指向候选点）
+        size_t dim = *(size_t *)dist_func_param_;
+        auto q_data = getDataByInternalId(query);
+        for (int i = 0; i < k; ++i) {
+            std::vector<float> dir_vec(dim);
+            auto c_data = getDataByInternalId(candidates[i].second);
+            for (size_t j = 0; j < dim; ++j) {
+                dir_vec[j] = c_data[j] - q_data[j];
+            }
+            local_vecs.push_back(dir_vec);
+        }
+
+        // 计算相邻向量余弦相似度序列
+        std::vector<float> cos_sims;
+        cos_sims.reserve(k);
+        for (int i = 1; i < k; ++i) {
+            float cos_sim = cosine_similarity(local_vecs[i - 1], local_vecs[i]);
+            cos_sims.push_back(cos_sim);
+        }
+
+        // 计算余弦相似度的方差（反映方向变化程度）
+        float mean = 0.0f;
+        for (float sim : cos_sims) mean += sim;
+        mean /= cos_sims.size();
+
+        float variance = 0.0f;
+        for (float sim : cos_sims) {
+            variance += (sim - mean) * (sim - mean);
+        }
+        variance /= cos_sims.size();
+
+        {
+            std::unique_lock<std::mutex> lock(table_lock);
+            ST.candidate_angle_mean_ += mean;
+            ST.candidate_angle_var_ += variance;
+            ST.candidates_angle_mean_.push_back(mean);
+            ST.candidates_angle_var_.push_back(variance);
+            ST.prune_count_ ++;
+        }
+
+        // 映射函数：方差越小（聚簇）→ 角度越小；方差越大（分散）→ 角度越大
+        // 使用指数衰减映射：聚簇区域敏感，分散区域平缓
+        float cluster_factor = std::exp(-2.0f * variance); // 方差越大，因子越小
+        float angle = angle_min + (angle_max - angle_min) * (1.0f - cluster_factor);
+
+        return std::clamp(angle, angle_min, angle_max);
+    }
+
 
     void getNeighborsByHeuristic2(
+        tableint query_id,
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
-        const size_t M) {
+        const size_t M, int level) {
         if (top_candidates.size() < M) {
             return;
         }
 
+        std::vector<std::pair<dist_t, tableint>> queue_dynamic;
+        queue_dynamic.reserve(top_candidates.size());
+
         std::priority_queue<std::pair<dist_t, tableint>> queue_closest;
         std::vector<std::pair<dist_t, tableint>> return_list;
         while (top_candidates.size() > 0) {
-            queue_closest.emplace(-top_candidates.top().first, top_candidates.top().second);
+            auto top_candidate = top_candidates.top();
+            queue_closest.emplace(-top_candidate.first, top_candidate.second);
+            queue_dynamic.push_back(top_candidate);
             top_candidates.pop();
         }
 
+        // // sort queue_dynamic by distance to ascending order
+        // std::sort(queue_dynamic.begin(), queue_dynamic.end(), 
+        //     [](const std::pair<dist_t, tableint>& a, const std::pair<dist_t, tableint>& b){
+        //         return a.first < b.first;
+        //     });
+
+        // dynamic_angle_threshold(query_id, queue_dynamic);
+
+        int max_rank = queue_closest.size();
+        int cur_rank = 0;
+
+        auto threshold = level > 0 ? prune_threshold_ : prune_threshold_l0_;
         while (queue_closest.size()) {
             if (return_list.size() >= M)
                 break;
             std::pair<dist_t, tableint> curent_pair = queue_closest.top();
             dist_t dist_to_query = -curent_pair.first;
             queue_closest.pop();
+
+            // std::mt19937 rng = init_random_engine();
+            // bool good = should_retain_independent(cur_rank, max_rank, 5, rng);
+
             bool good = true;
 
             for (std::pair<dist_t, tableint> second_pair : return_list) {
-                dist_t curdist =
-                        fstdistfunc_(getDataByInternalId(second_pair.second),
-                                        getDataByInternalId(curent_pair.second),
-                                        dist_func_param_);
-                if (curdist < dist_to_query) {
-                    good = false;
-                    break;
-                }
+                // dist_t curdist =
+                //         fstdistfunc_(getDataByInternalId(second_pair.second),
+                //                         getDataByInternalId(curent_pair.second),
+                //                         dist_func_param_);
+                // if (curdist < dist_to_query) {
+                //     good = false;
+                //     break;
+                // }
 
                 // IPDG prune method
                 // dist_t self_ip = fstdistfunc_(getDataByInternalId(curent_pair.second),
@@ -486,10 +763,27 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 //     good = false;
                 //     break;
                 // }
+
+                // if (level == 0) {
+                //     break;
+                // }
+
+                // use Angle prune method
+                tableint a = second_pair.second;
+                tableint b = curent_pair.second;
+                dist_t curdist = fstdistfunc_(getDataByInternalId(a), getDataByInternalId(b), dist_func_param_);
+                dist_t cos_ab = curdist / (norm_[a] * norm_[b]);
+                // cos(60) = 0.5
+                if (cos_ab > threshold) {
+                    good = false;
+                    break;
+                }
             }
+
             if (good) {
                 return_list.push_back(curent_pair);
             }
+            cur_rank++;
         }
 
         for (std::pair<dist_t, tableint> curent_pair : return_list) {
@@ -525,7 +819,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         int level,
         bool isUpdate) {
         size_t Mcurmax = level ? maxM_ : maxM0_;
-        getNeighborsByHeuristic2(top_candidates, M_);
+        getNeighborsByHeuristic2(cur_c, top_candidates, M_, level);
         if (top_candidates.size() > M_)
             throw std::runtime_error("Should be not be more than M_ candidates returned by the heuristic");
 
@@ -615,7 +909,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                                 dist_func_param_), data[j]);
                     }
 
-                    getNeighborsByHeuristic2(candidates, Mcurmax);
+                    getNeighborsByHeuristic2(selectedNeighbors[idx], candidates, Mcurmax, level);
 
                     int indx = 0;
                     while (candidates.size() > 0) {
@@ -660,6 +954,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (data_level0_memory_new == nullptr)
             throw std::runtime_error("Not enough memory: resizeIndex failed to allocate base layer");
         data_level0_memory_ = data_level0_memory_new;
+
+        // Reallocate norm
+        dist_t * norm_new = (dist_t *) realloc(norm_, new_max_elements * sizeof(dist_t));
+        if (norm_new == nullptr)
+            throw std::runtime_error("Not enough memory: resizeIndex failed to allocate norm");
+        norm_ = norm_new;
 
         // Reallocate all other layers
         char ** linkLists_new = (char **) realloc(linkLists_, sizeof(void *) * new_max_elements);
@@ -760,9 +1060,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         readBinaryPOD(input, mult_);
         readBinaryPOD(input, ef_construction_);
 
+        s_ = s;
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
+        norm_ = (dist_t *)malloc(sizeof(dist_t) * max_elements_);
 
         auto pos = input.tellg();
 
@@ -1001,6 +1303,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             label_lookup_[label] = internal_id_replaced;
             lock_table.unlock();
 
+            dist_t norm = s_->norm((const float*)data_point, *(size_t *)dist_func_param_);
+            norm_[internal_id_replaced] = norm;
+
             unmarkDeletedInternal(internal_id_replaced);
             updatePoint(data_point, internal_id_replaced, 1.0);
         }
@@ -1065,7 +1370,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
 
                 // Retrieve neighbours using heuristic and set connections.
-                getNeighborsByHeuristic2(candidates, layer == 0 ? maxM0_ : maxM_);
+                getNeighborsByHeuristic2(neigh, candidates, layer == 0 ? maxM0_ : maxM_, layer);
 
                 {
                     std::unique_lock <std::mutex> lock(link_list_locks_[neigh]);
@@ -1217,6 +1522,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // Initialisation of the data and label
         memcpy(getExternalLabeLp(cur_c), &label, sizeof(labeltype));
         memcpy(getDataByInternalId(cur_c), data_point, data_size_);
+        dist_t norm = s_->norm((const float*)data_point, *(size_t *)dist_func_param_);
+        norm_[cur_c] = norm;
 
         if (curlevel) {
             linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel + 1);
