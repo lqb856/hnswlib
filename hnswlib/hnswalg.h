@@ -743,14 +743,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             bool good = true;
 
             for (std::pair<dist_t, tableint> second_pair : return_list) {
-                // dist_t curdist =
-                //         fstdistfunc_(getDataByInternalId(second_pair.second),
-                //                         getDataByInternalId(curent_pair.second),
-                //                         dist_func_param_);
-                // if (curdist < dist_to_query) {
-                //     good = false;
-                //     break;
-                // }
+                dist_t curdist =
+                        fstdistfunc_(getDataByInternalId(second_pair.second),
+                                        getDataByInternalId(curent_pair.second),
+                                        dist_func_param_);
+                if (curdist < dist_to_query) {
+                    good = false;
+                    break;
+                }
 
                 // IPDG prune method
                 // dist_t self_ip = fstdistfunc_(getDataByInternalId(curent_pair.second),
@@ -769,15 +769,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 // }
 
                 // use Angle prune method
-                tableint a = second_pair.second;
-                tableint b = curent_pair.second;
-                dist_t curdist = fstdistfunc_(getDataByInternalId(a), getDataByInternalId(b), dist_func_param_);
-                dist_t cos_ab = curdist / (norm_[a] * norm_[b]);
-                // cos(60) = 0.5
-                if (cos_ab > threshold) {
-                    good = false;
-                    break;
-                }
+                // tableint a = second_pair.second;
+                // tableint b = curent_pair.second;
+                // dist_t curdist = fstdistfunc_(getDataByInternalId(a), getDataByInternalId(b), dist_func_param_);
+                // dist_t cos_ab = curdist / (norm_[a] * norm_[b]);
+                // // cos(60) = 0.5
+                // if (cos_ab > threshold) {
+                //     good = false;
+                //     break;
+                // }
             }
 
             if (good) {
@@ -1734,44 +1734,49 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     // remove origin node
     // for Möbius algorithm
     // remove origin node and its connections
-    void remove_oringin(labeltype origin) {
-        if (label_lookup_[origin] == enterpoint_node_) {
+    void remove_origin(labeltype origin) {
+        const tableint origin_id = label_lookup_.at(origin);
+        if (origin_id == enterpoint_node_) {
             std::cout << "Origin node is enterpoint node" << std::endl;
         }
-        // markDelete(origin);
+        markDelete(origin);
         remove_origin_links(origin);
     }
 
     // Remove origin node's connections.
     // Origin node can not be search after remove.
     // We suppose that origin node has lable 0.
-    void remove_origin_links(labeltype origin) {
-        tableint origin_id = label_lookup_[origin];
-        if (origin_id < 0 || origin_id >= cur_element_count)
-            throw std::runtime_error("id error");
-        for (size_t i = 1; i < cur_element_count; i++) {
-            tableint curid = label_lookup_[i];
-            int level = element_levels_[curid];
-            for (int l = 0; l < level; l++) {
-                linklistsizeint *ll_cur = get_linklist_at_level(curid, l);
-                int size = getListCount(ll_cur);
-                tableint *data = (tableint *) (ll_cur + 1);
-                int left = 0, right = 0, count = 0;
-                while (right < size) {
-                    if (data[right] == origin_id) {
-                        right++;
-                        count++;
-                    } else {
-                        data[left] = data[right];
-                        left++;
-                        right++;
+    void remove_origin_links(tableint origin_id) {
+        if (origin_id < 0 || origin_id >= cur_element_count) {
+            throw std::invalid_argument("Invalid origin ID");
+        }
+    
+        // 并行化处理 (OpenMP)
+        #pragma omp parallel for
+        for (tableint curid = 0; curid < cur_element_count; ++curid) {
+            if (curid == origin_id) continue;
+    
+            for (int l = 0; l <= element_levels_[curid]; ++l) {
+                linklistsizeint* ll_cur = get_linklist_at_level(curid, l);
+                const int original_size = getListCount(ll_cur);
+                tableint* data = reinterpret_cast<tableint*>(ll_cur + 1);
+    
+                // 双指针法移除目标节点
+                int new_size = 0;
+                for (int i = 0; i < original_size; ++i) {
+                    if (data[i] != origin_id) {
+                        data[new_size++] = data[i];
                     }
                 }
-                setListCount(ll_cur, size - count);
+                
+                // 安全更新链表大小
+                if (new_size != original_size) {
+                    setListCount(ll_cur, new_size);
+                }
             }
         }
-        std::cout << "All links to origin node are removed!" << std::endl;
     }
+    
 
     // replace data with original data
     // for Möbius algorithm
